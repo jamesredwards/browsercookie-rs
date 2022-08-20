@@ -1,19 +1,15 @@
+use anyhow::{anyhow, Error};
 use byteorder::{LittleEndian, ReadBytesExt};
 use cookie::{Cookie, CookieJar};
-#[allow(unused_imports)]
-use dirs::home_dir;
 use ini::Ini;
 use lz4::block::decompress;
 use memmap::MmapOptions;
 use regex::Regex;
 use serde_json::Value;
-use sqlite;
-use std::error::Error;
 use std::fs;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use tempdir;
 
 use crate::errors::BrowsercookieError;
 
@@ -22,7 +18,6 @@ use crate::errors::BrowsercookieError;
 struct MozCookie {
     host: String,
     name: String,
-    originAttributes: Value,
     path: String,
     value: String,
 
@@ -43,7 +38,7 @@ fn get_master_profile_path() -> PathBuf {
 
 #[cfg(not(test))]
 fn get_master_profile_path() -> PathBuf {
-    let mut path = home_dir().expect("Unable to find home directory");
+    let mut path = dirs::home_dir().expect("Unable to find home directory");
     if cfg!(target_os = "macos") {
         path.push("Library/Application Support/Firefox/profiles.ini");
     } else if cfg!(target_os = "linux") {
@@ -52,14 +47,14 @@ fn get_master_profile_path() -> PathBuf {
     path
 }
 
-fn get_default_profile_path(master_profile: &Path) -> Result<PathBuf, Box<Error>> {
+fn get_default_profile_path(master_profile: &Path) -> Result<PathBuf, Error> {
     let profiles_conf: Ini;
     let mut default_profile_path = PathBuf::from(master_profile);
     default_profile_path.pop();
 
     match Ini::load_from_file(&master_profile) {
         Err(_) => {
-            return Err(Box::new(BrowsercookieError::InvalidProfile(String::from(
+            return Err(anyhow!(BrowsercookieError::InvalidProfile(String::from(
                 "Unable to parse firefox ini profile",
             ))))
         }
@@ -71,8 +66,8 @@ fn get_default_profile_path(master_profile: &Path) -> Result<PathBuf, Box<Error>
             // for firefox versions >= 72.0.1
             if s.to_owned().starts_with("Install") {
                 let section = profiles_conf
-                    .section(sec.clone())
-                    .ok_or("Invalid profile section")?;
+                    .section(sec)
+                    .ok_or_else(|| anyhow!("Invalid profile section"))?;
                 match section.get("Default") {
                     Some(path) => {
                         default_profile_path.push(path);
@@ -82,8 +77,8 @@ fn get_default_profile_path(master_profile: &Path) -> Result<PathBuf, Box<Error>
                 }
             } else {
                 let section = profiles_conf
-                    .section(sec.clone())
-                    .ok_or("Invalid profile section")?;
+                    .section(sec)
+                    .ok_or_else(|| anyhow!("Invalid profile section"))?;
                 match section.get("Default").and(section.get("Path")) {
                     Some(path) => {
                         default_profile_path.push(path);
@@ -102,30 +97,39 @@ fn load_from_recovery(
     recovery_path: &Path,
     bcj: &mut Box<CookieJar>,
     domain_regex: &Regex,
-) -> Result<bool, Box<Error>> {
+) -> Result<bool, Error> {
     let recovery_file = File::open(recovery_path)?;
     let recovery_mmap = unsafe { MmapOptions::new().map(&recovery_file)? };
 
     if recovery_mmap.len() <= 8
-        || recovery_mmap.get(0..8).ok_or("Invalid recovery")? != "mozLz40\0".as_bytes()
+        || recovery_mmap
+            .get(0..8)
+            .ok_or_else(|| anyhow!("Invalid recovery"))?
+            != "mozLz40\0".as_bytes()
     {
-        return Err(Box::new(BrowsercookieError::InvalidRecovery(String::from(
+        return Err(anyhow!(BrowsercookieError::InvalidRecovery(String::from(
             "Firefox invalid recovery archive",
         ))));
     }
 
-    let mut rdr = Cursor::new(recovery_mmap.get(8..12).ok_or("Invalid recovery")?);
+    let mut rdr = Cursor::new(
+        recovery_mmap
+            .get(8..12)
+            .ok_or_else(|| anyhow!("Invalid recovery"))?,
+    );
     let uncompressed_size = rdr.read_i32::<LittleEndian>().ok();
 
     let recovery_json_bytes = decompress(
-        recovery_mmap.get(12..).ok_or("Invalid recovery")?,
+        recovery_mmap
+            .get(12..)
+            .ok_or_else(|| anyhow!("Invalid recovery"))?,
         uncompressed_size,
     )?;
 
     let recovery_json: Value = serde_json::from_slice(&recovery_json_bytes)?;
     for c in recovery_json["cookies"]
         .as_array()
-        .ok_or("Invalid recovery")?
+        .ok_or_else(|| anyhow!("Invalid recovery"))?
     {
         if let Ok(cookie) =
             serde_json::from_value(c.clone()) as Result<MozCookie, serde_json::error::Error>
@@ -150,7 +154,7 @@ fn load_from_sqldb(
     profile_path: &Path,
     bcj: &mut Box<CookieJar>,
     domain_regex: &Regex,
-) -> Result<(), Box<Error>> {
+) -> Result<(), Error> {
     let sql_path = profile_path.join(Path::new("cookies.sqlite"));
     let tmp_dir = tempdir::TempDir::new("ff_cookies")?;
     let tmp_cookies = tmp_dir.path().join("cookies.sqlite");
@@ -165,22 +169,16 @@ fn load_from_sqldb(
     while let Some(Ok(row)) = cursor.next() {
         let host: String = row.get::<String, _>(0);
         let path: String = row.get::<String, _>(1);
-        let isSecure: bool = match row.get::<i64, _>(2) {
-            1 => true,
-            _ => false,
-        };
-        let expiry: i64 = row.get::<i64, _>(3);
+        let is_secure = matches!(row.get::<i64, _>(2), 1);
+        let _expiry: i64 = row.get::<i64, _>(3);
         let name: String = row.get::<String, _>(4);
         let value: String = row.get::<String, _>(5);
-        let isHttpOnly: bool = match row.get::<i64, _>(6) {
-            1 => true,
-            _ => false,
-        };
+        let is_http_only: bool = matches!(row.get::<i64, _>(6), 1);
         let cookie = Cookie::build(name, value)
             .domain(host)
             .path(path)
-            .secure(isSecure)
-            .http_only(isHttpOnly)
+            .secure(is_secure)
+            .http_only(is_http_only)
             .finish();
 
         bcj.add(cookie);
@@ -191,7 +189,7 @@ fn load_from_sqldb(
     Ok(())
 }
 
-pub(crate) fn load(bcj: &mut Box<CookieJar>, domain_regex: &Regex) -> Result<(), Box<Error>> {
+pub(crate) fn load(bcj: &mut Box<CookieJar>, domain_regex: &Regex) -> Result<(), Error> {
     // Returns a CookieJar on heap if following steps go right
     //
     // 1. Get default profile path for firefox from master ini profiles config.
@@ -199,7 +197,7 @@ pub(crate) fn load(bcj: &mut Box<CookieJar>, domain_regex: &Regex) -> Result<(),
     //    of the default profile.
     let master_profile_path = get_master_profile_path();
     if !master_profile_path.exists() {
-        return Err(Box::new(BrowsercookieError::ProfileMissing(String::from(
+        return Err(anyhow!(BrowsercookieError::ProfileMissing(String::from(
             "Firefox profile path doesn't exist",
         ))));
     }
@@ -210,7 +208,7 @@ pub(crate) fn load(bcj: &mut Box<CookieJar>, domain_regex: &Regex) -> Result<(),
     recovery_path.push("sessionstore-backups/recovery.jsonlz4");
 
     if !recovery_path.exists() {
-        return Err(Box::new(BrowsercookieError::InvalidCookieStore(
+        return Err(anyhow!(BrowsercookieError::InvalidCookieStore(
             String::from("Firefox invalid cookie store"),
         )));
     }
